@@ -1,0 +1,23 @@
+-- tofu_character_services_2026_11_22_00_archivist.sql (mod-tofu-character-services module SQL)
+-- What: adds Archivist Ellery Ashby <Character Services> (creature_template 900042, ScriptName npc_tofu_character_services; the C++ script builds every menu, so gossip_menu_id is 0) with the model of Clerk Horrace Whitesteed (2448, display 3644, not changed), and the greetings npc_text 900018 (main menu) and 900019 (character order page). Neutral (faction 35), not attackable by players (unit_flags 256), gossip only (npcflag 1).
+-- IDs: registry/ids.tsv in wow-tofuworld-internal, creature 900042 and npc_text 900018 to 900019. No stock rows change.
+-- Schema: acore_world. Applied by the worldserver's updater as a module file (state MODULE). Re-runnable: DELETE, then INSERT with fixed values, on this file's IDs only.
+-- Apply: worldserver restart. New entry, so no client Cache deletion is needed now; after any later change to name, subname, or the texts, players relaunch through the Tofu launcher (clears Cache). No spawn: place with .npc add 900042.
+-- Check:
+--   SELECT entry, name, subname, faction, npcflag, unit_flags, ScriptName FROM acore_world.creature_template WHERE entry = 900042;  -- expected 900042, Archivist Ellery Ashby, Character Services, 35, 1, 256, npc_tofu_character_services
+--   SELECT CreatureID, Idx, CreatureDisplayID FROM acore_world.creature_template_model WHERE CreatureID = 900042;  -- expected 900042, 0, 3644
+--   SELECT ID FROM acore_world.npc_text WHERE ID BETWEEN 900018 AND 900019;  -- expected 900018, 900019
+-- Revert: sql-revert/db-world/revert_tofu_character_services_2026_11_22_00_archivist.sql (run by hand after removing the module; the updater never runs it).
+
+DELETE FROM `creature_template` WHERE `entry` = 900042;
+INSERT INTO `creature_template` (`entry`, `difficulty_entry_1`, `difficulty_entry_2`, `difficulty_entry_3`, `KillCredit1`, `KillCredit2`, `name`, `subname`, `IconName`, `gossip_menu_id`, `minlevel`, `maxlevel`, `exp`, `faction`, `npcflag`, `speed_walk`, `speed_run`, `speed_swim`, `speed_flight`, `detection_range`, `rank`, `dmgschool`, `DamageModifier`, `BaseAttackTime`, `RangeAttackTime`, `BaseVariance`, `RangeVariance`, `unit_class`, `unit_flags`, `unit_flags2`, `dynamicflags`, `family`, `type`, `type_flags`, `lootid`, `pickpocketloot`, `skinloot`, `PetSpellDataId`, `VehicleId`, `mingold`, `maxgold`, `AIName`, `MovementType`, `HoverHeight`, `HealthModifier`, `ManaModifier`, `ArmorModifier`, `ExperienceModifier`, `RacialLeader`, `movementId`, `RegenHealth`, `CreatureImmunitiesId`, `flags_extra`, `ScriptName`, `VerifiedBuild`) VALUES
+(900042, 0, 0, 0, 0, 0, 'Archivist Ellery Ashby', 'Character Services', '', 0, 80, 80, 0, 35, 1, 1, 1.14286, 1, 1, 20, 0, 0, 1, 2000, 2000, 1, 1, 1, 256, 2048, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 0, '', 0, 1, 1, 1, 1, 1, 0, 0, 1, 0, 0, 'npc_tofu_character_services', 0);
+
+DELETE FROM `creature_template_model` WHERE `CreatureID` = 900042;
+INSERT INTO `creature_template_model` (`CreatureID`, `Idx`, `CreatureDisplayID`, `DisplayScale`, `Probability`, `VerifiedBuild`) VALUES
+(900042, 0, 3644, 1, 1, 0);
+
+DELETE FROM `npc_text` WHERE `ID` BETWEEN 900018 AND 900019;
+INSERT INTO `npc_text` (`ID`, `text0_0`, `text0_1`, `BroadcastTextID0`, `lang0`, `Probability0`, `VerifiedBuild`) VALUES
+(900018, 'Welcome to the records hall of Tofu Worldview, $n. Every adventurer on these shores has a page in my ledgers, and I keep them in order.$B$BI can arrange the characters on your account, enter a new name, or file your papers for a new race or a new faction. Those last three are finished at the character screen once you log out.$B$BAnd if you have wandered in still smelling of battle, I can see that the record shows you at peace.', 'Welcome to the records hall of Tofu Worldview, $n. Every adventurer on these shores has a page in my ledgers, and I keep them in order.$B$BI can arrange the characters on your account, enter a new name, or file your papers for a new race or a new faction. Those last three are finished at the character screen once you log out.$B$BAnd if you have wandered in still smelling of battle, I can see that the record shows you at peace.', 0, 0, 1, 0),
+(900019, 'Here is your account''s roster, in the order the character screen shows it. Choose a character, then tell me where its page belongs.$B$BThe new order shows the next time you return to the character screen.', 'Here is your account''s roster, in the order the character screen shows it. Choose a character, then tell me where its page belongs.$B$BThe new order shows the next time you return to the character screen.', 0, 0, 1, 0);

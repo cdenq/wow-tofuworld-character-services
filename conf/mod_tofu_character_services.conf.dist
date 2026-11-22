@@ -1,0 +1,49 @@
+[worldserver]
+
+########################################
+# mod-tofu-character-services
+########################################
+#
+# Archivist Ellery Ashby <Character Services> (creature 900042, place with .npc add 900042): arrange the account's
+# characters, change name, change race, change faction, and leave combat. Bots never get these services.
+#
+#    TofuCharServices.Enable
+#        Description: Turn the module on. While off, the NPC only says goodbye and .charorder is refused.
+#        Default:     0 - Off
+#                     1 - On
+
+TofuCharServices.Enable = 0
+
+#    TofuCharServices.OrderCommand
+#        Description: Also allow the player command .charorder, which opens the character order menu anywhere.
+#                     While on, ".char" stops working as an abbreviation of ".character" (it matches both commands);
+#                     type ".chara" or the full name.
+#        Default:     1 - On
+#                     0 - Off (only the NPC)
+
+TofuCharServices.OrderCommand = 1
+
+#    TofuCharServices.RenameCost
+#    TofuCharServices.RaceChangeCost
+#    TofuCharServices.FactionChangeCost
+#        Description: Price in copper (10000 = 1 gold), taken when the change is bought and refunded in full if the
+#                     player cancels it before logging out. 0 is free.
+#        Default:     0
+
+TofuCharServices.RenameCost = 0
+TofuCharServices.RaceChangeCost = 0
+TofuCharServices.FactionChangeCost = 0
+
+#    TofuCharServices.LeaveCombat.Enable
+#        Description: Offer "Leave combat" while the player is in combat. Refused inside instances (dungeons, raids,
+#                     battlegrounds, arenas) and while a living attacker is within LeaveCombat.Range yards.
+#        Default:     1 - On
+#                     0 - Off
+
+TofuCharServices.LeaveCombat.Enable = 1
+
+#    TofuCharServices.LeaveCombat.Range
+#        Description: Yards. A living unit attacking the player this close blocks "Leave combat".
+#        Default:     50
+
+TofuCharServices.LeaveCombat.Range = 50
