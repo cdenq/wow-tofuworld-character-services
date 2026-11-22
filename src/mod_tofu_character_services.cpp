@@ -10,6 +10,12 @@
  *   set. The 3.3.5a client then shows its own rename, race change or faction change screen at the character list,
  *   and the core's CharacterHandler does the conversion.
  * - Leave combat: ends the player's combat state outside instances when nothing alive is attacking nearby.
+ * - Menus for other modules' player commands: Autonomous alts and Alt parties (.autoalt, mod-autonomous-altbots),
+ *   AoE loot (.aoeloot, mod-aoe-loot), and XP rate (.xp, mod-individual-xp). Each option runs the real command for
+ *   the player through ChatHandler::ParseCommands, exactly as if it were typed, so every check, permission, lock, and
+ *   reply of those modules applies unchanged and this module does not link against them. Typed input (a party name,
+ *   an XP rate) comes from the gossip text box and is validated before it is put into a command. State shown in the
+ *   menus (which characters are autonomous alts, which parties exist) is read with SELECTs only.
  * Menu style after azerothcore/mod-npc-services (inline icons on each option); no code is copied from it.
  *
  * Bots never get these services: every playerbot session is headless (no socket), so WorldSession::IsHeadless()
@@ -30,17 +36,30 @@
 #include "WorldSession.h"
 
 #include <algorithm>
+#include <cctype>
+#include <cstdlib>
 #include <iterator>
+#include <mutex>
+#include <sstream>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 using namespace Acore::ChatCommands;
 
 namespace
 {
-    // npc_text rows from this module's SQL (registry: npc_text 900018 to 900019).
+    // npc_text rows from this module's SQL (registry: npc_text 900018 to 900019 and 900064 to 900066).
     constexpr uint32 NPC_TEXT_MAIN = 900018;
     constexpr uint32 NPC_TEXT_ORDER = 900019;
+    constexpr uint32 NPC_TEXT_ALTS = 900064;
+    constexpr uint32 NPC_TEXT_PARTIES = 900065;
+    constexpr uint32 NPC_TEXT_XP = 900066;
+
+    // mod-autonomous-altbots stores each character's on/off choice in this player setting (read only here).
+    constexpr char AUTOALT_SETTING_SOURCE[] = "mod_autonomous_altbots";
+    constexpr std::size_t PARTY_NAME_MAX_LENGTH = 32;
+    constexpr std::size_t MAX_LIST_OPTIONS = 30;
 
     // Player setting that remembers what was paid for the pending change, so a cancel refunds exactly that.
     constexpr char SETTING_SOURCE[] = "mod-tofu-character-services";
@@ -57,6 +76,39 @@ namespace
     constexpr uint32 ACTION_CANCEL = 6;
     constexpr uint32 ACTION_GOODBYE = 7;
     constexpr uint32 ACTION_BACK_TO_MAIN = 8;
+    constexpr uint32 ACTION_ALTS = 9;
+    constexpr uint32 ACTION_PARTIES = 10;
+    constexpr uint32 ACTION_AOE_ON = 11;
+    constexpr uint32 ACTION_AOE_OFF = 12;
+    constexpr uint32 ACTION_XP = 13;
+
+    // Autonomous alts (action = character GUID unless noted).
+    constexpr uint32 SENDER_ALT_SELECT = 0x54430010;
+    constexpr uint32 SENDER_ALT_ON = 0x54430011;
+    constexpr uint32 SENDER_ALT_OFF = 0x54430012;
+    constexpr uint32 SENDER_ALT_STATUS = 0x54430013;
+    constexpr uint32 SENDER_ALT_LIST = 0x54430014;      // action 0: .autoalt list
+
+    // Alt parties (action = party id unless noted).
+    constexpr uint32 SENDER_PARTY_SELECT = 0x54430020;
+    constexpr uint32 SENDER_PARTY_CREATE = 0x54430021;  // coded: the typed name
+    constexpr uint32 SENDER_PARTY_JOIN = 0x54430022;
+    constexpr uint32 SENDER_PARTY_ADD_MENU = 0x54430023;
+    constexpr uint32 SENDER_PARTY_ADD = 0x54430024;     // action = character GUID; party from the open add menu
+    constexpr uint32 SENDER_PARTY_REMOVE_MENU = 0x54430025;
+    constexpr uint32 SENDER_PARTY_REMOVE = 0x54430026;  // action = character GUID
+    constexpr uint32 SENDER_PARTY_DISBAND = 0x54430027;
+    constexpr uint32 SENDER_PARTY_LIST = 0x54430028;    // action 0: every party; otherwise that party
+    constexpr uint32 SENDER_PARTY_BACK = 0x54430029;    // action 0: back to the party list
+
+    // XP rate (action = rate for presets).
+    constexpr uint32 SENDER_XP = 0x54430030;
+    constexpr uint32 SENDER_XP_PRESET = 0x54430031;
+    constexpr uint32 SENDER_XP_CUSTOM = 0x54430032;     // coded: the typed rate
+    constexpr uint32 XP_VIEW = 1;
+    constexpr uint32 XP_DEFAULT = 2;
+    constexpr uint32 XP_ENABLE = 3;
+    constexpr uint32 XP_DISABLE = 4;
 
     constexpr uint32 CHARACTER_ORDER_SENDER_SELECT = 0x434F0001;
     constexpr uint32 CHARACTER_ORDER_SENDER_SELECTED = 0x434F0002;
@@ -83,9 +135,35 @@ namespace
         uint32 factionCost = 0;
         bool leaveCombat = true;
         float leaveCombatRange = 50.0f;
+        bool autoAlt = false;
+        bool autoAltParties = false;
+        bool aoeLoot = false;
+        bool xp = false;
+        std::vector<uint32> xpPresets;
     };
 
     ModuleConfig g_Config;
+
+    // Party whose "Add a member" menu each player has open (player GUID counter -> party id). Gossip runs on map
+    // update threads, so access is locked.
+    std::mutex g_AddMenuMutex;
+    std::unordered_map<uint32, uint32> g_AddMenuParty;
+
+    std::vector<uint32> ParsePresets(std::string const& text)
+    {
+        std::vector<uint32> presets;
+        std::istringstream stream(text);
+        std::string token;
+        while (stream >> token)
+        {
+            if (token.empty() || !std::all_of(token.begin(), token.end(), [](unsigned char c) { return std::isdigit(c); }) || token.size() > 4)
+                continue;
+            uint32 const value = uint32(std::strtoul(token.c_str(), nullptr, 10));
+            if (value && std::find(presets.begin(), presets.end(), value) == presets.end() && presets.size() < 10)
+                presets.push_back(value);
+        }
+        return presets;
+    }
 
     void LoadConfig()
     {
@@ -96,6 +174,11 @@ namespace
         g_Config.factionCost = sConfigMgr->GetOption<uint32>("TofuCharServices.FactionChangeCost", 0);
         g_Config.leaveCombat = sConfigMgr->GetOption<bool>("TofuCharServices.LeaveCombat.Enable", true);
         g_Config.leaveCombatRange = sConfigMgr->GetOption<float>("TofuCharServices.LeaveCombat.Range", 50.0f);
+        g_Config.autoAlt = sConfigMgr->GetOption<bool>("TofuCharServices.AutoAlt.Enable", false);
+        g_Config.autoAltParties = sConfigMgr->GetOption<bool>("TofuCharServices.AutoAlt.Parties", false);
+        g_Config.aoeLoot = sConfigMgr->GetOption<bool>("TofuCharServices.AoeLoot.Enable", false);
+        g_Config.xp = sConfigMgr->GetOption<bool>("TofuCharServices.Xp.Enable", false);
+        g_Config.xpPresets = ParsePresets(sConfigMgr->GetOption<std::string>("TofuCharServices.Xp.Presets", "1 2 3 5 10 20"));
     }
 
     std::string Icon(char const* name)
@@ -625,6 +708,519 @@ namespace
     }
 
     // ---------------------------------------------------------------------------------------------------------
+    // Other modules' player commands
+    // ---------------------------------------------------------------------------------------------------------
+
+    // Runs a player command exactly as if the player had typed it (".xp view" and so on). The command's own
+    // module checks permissions and replies in the player's chat.
+    void RunCommand(Player* player, std::string const& command)
+    {
+        CloseGossipMenuFor(player);
+        ChatHandler handler(player->GetSession());
+        if (!handler.ParseCommands(command))
+            Notify(player, "That command is not available on this server right now.");
+    }
+
+    bool IsValidPartyName(std::string const& name)
+    {
+        if (name.empty() || name.size() > PARTY_NAME_MAX_LENGTH)
+            return false;
+        return std::all_of(name.begin(), name.end(), [](unsigned char c) { return std::isalnum(c) || c == '-' || c == '_'; });
+    }
+
+    // Character names are stored as letters only; anything else is not put into a command.
+    bool IsSafeCharacterName(std::string const& name)
+    {
+        return !name.empty() && name.size() <= 12 && std::all_of(name.begin(), name.end(), [](unsigned char c) { return c >= 0x80 || std::isalpha(c); });
+    }
+
+    // Character settings are stored as space-separated values; returns the value at index, or 0.
+    uint32 SettingValue(std::string const& data, uint32 index)
+    {
+        std::istringstream stream(data);
+        std::string token;
+        for (uint32 i = 0; stream >> token; ++i)
+            if (i == index)
+                return uint32(std::strtoul(token.c_str(), nullptr, 10));
+        return 0;
+    }
+
+    struct AltEntry
+    {
+        uint32 Guid;
+        std::string Name;
+        uint8 Level;
+        uint8 Class;
+        bool Enabled;
+        uint32 PartyId;
+    };
+
+    // The account's characters except the one the player is on, with their autonomous alt state and party.
+    std::vector<AltEntry> LoadAccountAlts(Player* player, bool withParty)
+    {
+        std::vector<AltEntry> alts;
+        std::string const partyColumn = withParty ? "COALESCE(m.party_id, 0)" : "0";
+        std::string const partyJoin = withParty ? "LEFT JOIN tofu_autoalt_party_member m ON m.guid = c.guid " : "";
+
+        QueryResult result = CharacterDatabase.Query(
+            "SELECT c.guid, c.name, c.level, c.class, COALESCE(s.data, ''), " + partyColumn + " "
+            "FROM characters c "
+            "LEFT JOIN character_settings s ON s.guid = c.guid AND s.source = '" + std::string(AUTOALT_SETTING_SOURCE) + "' " +
+            partyJoin +
+            "WHERE c.account = {} AND c.guid <> {} AND c.deleteInfos_Name IS NULL "
+            "ORDER BY COALESCE(c.`order`, c.guid), c.guid",
+            player->GetSession()->GetAccountId(), player->GetGUID().GetCounter());
+
+        if (!result)
+            return alts;
+
+        do
+        {
+            Field* fields = result->Fetch();
+            AltEntry entry;
+            entry.Guid = fields[0].Get<uint32>();
+            entry.Name = fields[1].Get<std::string>();
+            entry.Level = fields[2].Get<uint8>();
+            entry.Class = fields[3].Get<uint8>();
+            entry.Enabled = SettingValue(fields[4].Get<std::string>(), 0) != 0;
+            entry.PartyId = fields[5].Get<uint32>();
+            alts.push_back(entry);
+        }
+        while (result->NextRow() && alts.size() < MAX_LIST_OPTIONS);
+
+        return alts;
+    }
+
+    bool FindAccountAlt(Player* player, uint32 guid, AltEntry& found)
+    {
+        for (AltEntry const& entry : LoadAccountAlts(player, false))
+        {
+            if (entry.Guid == guid)
+            {
+                found = entry;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    std::string AltLabel(AltEntry const& entry)
+    {
+        return "|cff" + std::string(GetClassColor(entry.Class)) + entry.Name + "|r - Level " + std::to_string(entry.Level) +
+            " " + GetClassName(entry.Class) + (entry.Enabled ? " - |cff1E7A1Eon|r" : " - |cff7A1E1Eoff|r");
+    }
+
+    void ShowAltList(Player* player, Creature* creature)
+    {
+        ClearGossipMenuFor(player);
+
+        std::vector<AltEntry> const alts = LoadAccountAlts(player, false);
+        if (alts.empty())
+            AddGossipItemFor(player, GOSSIP_ICON_CHAT, "You have no other characters on this account.", SENDER_MAIN, ACTION_BACK_TO_MAIN);
+
+        for (AltEntry const& entry : alts)
+            AddGossipItemFor(player, GOSSIP_ICON_CHAT, AltLabel(entry), SENDER_ALT_SELECT, entry.Guid);
+
+        AddGossipItemFor(player, GOSSIP_ICON_CHAT, Icon("INV_Scroll_03") + "Show all my alts in chat", SENDER_ALT_LIST, 0);
+        AddGossipItemFor(player, GOSSIP_ICON_CHAT, "Back to character services", SENDER_MAIN, ACTION_BACK_TO_MAIN);
+        SendGossipMenuFor(player, NPC_TEXT_ALTS, creature->GetGUID());
+    }
+
+    void ShowAltPage(Player* player, Creature* creature, uint32 guid)
+    {
+        AltEntry entry;
+        if (!FindAccountAlt(player, guid, entry))
+        {
+            ShowAltList(player, creature);
+            return;
+        }
+
+        ClearGossipMenuFor(player);
+        AddGossipItemFor(player, GOSSIP_ICON_CHAT, AltLabel(entry), SENDER_ALT_SELECT, entry.Guid);
+        if (entry.Enabled)
+            AddGossipItemFor(player, GOSSIP_ICON_CHAT, Icon("Spell_ChargeNegative") + "Turn off: log it out and keep it offline", SENDER_ALT_OFF, entry.Guid);
+        else
+            AddGossipItemFor(player, GOSSIP_ICON_CHAT, Icon("Spell_ChargePositive") + "Turn on: let it play on its own", SENDER_ALT_ON, entry.Guid);
+        AddGossipItemFor(player, GOSSIP_ICON_CHAT, Icon("INV_Misc_Spyglass_02") + "Show its status in chat", SENDER_ALT_STATUS, entry.Guid);
+        AddGossipItemFor(player, GOSSIP_ICON_CHAT, "Back to my alts", SENDER_MAIN, ACTION_ALTS);
+        SendGossipMenuFor(player, NPC_TEXT_ALTS, creature->GetGUID());
+    }
+
+    struct PartyEntry
+    {
+        uint32 Id;
+        std::string Name;
+        uint32 Members;
+    };
+
+    std::vector<PartyEntry> LoadParties()
+    {
+        std::vector<PartyEntry> parties;
+        QueryResult result = CharacterDatabase.Query(
+            "SELECT p.id, p.name, COUNT(m.guid) FROM tofu_autoalt_party p "
+            "LEFT JOIN tofu_autoalt_party_member m ON m.party_id = p.id GROUP BY p.id, p.name ORDER BY p.name");
+
+        if (!result)
+            return parties;
+
+        do
+        {
+            Field* fields = result->Fetch();
+            PartyEntry entry;
+            entry.Id = fields[0].Get<uint32>();
+            entry.Name = fields[1].Get<std::string>();
+            entry.Members = uint32(fields[2].Get<uint64>());
+            if (IsValidPartyName(entry.Name))
+                parties.push_back(entry);
+        }
+        while (result->NextRow() && parties.size() < MAX_LIST_OPTIONS);
+
+        return parties;
+    }
+
+    bool FindParty(uint32 id, PartyEntry& found)
+    {
+        QueryResult result = CharacterDatabase.Query(
+            "SELECT p.id, p.name, (SELECT COUNT(*) FROM tofu_autoalt_party_member m WHERE m.party_id = p.id) FROM tofu_autoalt_party p WHERE p.id = {}", id);
+        if (!result)
+            return false;
+
+        Field* fields = result->Fetch();
+        found.Id = fields[0].Get<uint32>();
+        found.Name = fields[1].Get<std::string>();
+        found.Members = uint32(fields[2].Get<uint64>());
+        return IsValidPartyName(found.Name);
+    }
+
+    void ShowPartyList(Player* player, Creature* creature)
+    {
+        ClearGossipMenuFor(player);
+
+        for (PartyEntry const& party : LoadParties())
+            AddGossipItemFor(player, GOSSIP_ICON_CHAT, Icon("INV_Misc_GroupNeedMore") + party.Name + " (" + std::to_string(party.Members) + " of 5)", SENDER_PARTY_SELECT, party.Id);
+
+        AddGossipItemFor(player, GOSSIP_ICON_CHAT, Icon("Spell_ChargePositive") + "Create a party...", SENDER_PARTY_CREATE, 0, "Type a name for the new party: 1 to 32 letters, digits, - or _.", 0, true);
+        AddGossipItemFor(player, GOSSIP_ICON_CHAT, Icon("INV_Scroll_03") + "Show all parties in chat", SENDER_PARTY_LIST, 0);
+        AddGossipItemFor(player, GOSSIP_ICON_CHAT, "Back to character services", SENDER_MAIN, ACTION_BACK_TO_MAIN);
+        SendGossipMenuFor(player, NPC_TEXT_PARTIES, creature->GetGUID());
+    }
+
+    void ShowPartyPage(Player* player, Creature* creature, uint32 id)
+    {
+        PartyEntry party;
+        if (!FindParty(id, party))
+        {
+            Notify(player, "That party no longer exists.");
+            ShowPartyList(player, creature);
+            return;
+        }
+
+        ClearGossipMenuFor(player);
+        AddGossipItemFor(player, GOSSIP_ICON_CHAT, party.Name + " - " + std::to_string(party.Members) + " of 5 members", SENDER_PARTY_SELECT, party.Id);
+        AddGossipItemFor(player, GOSSIP_ICON_CHAT, Icon("Ability_Warrior_BattleShout") + "Join and lead this party", SENDER_PARTY_JOIN, party.Id);
+        if (party.Members < 5)
+            AddGossipItemFor(player, GOSSIP_ICON_CHAT, Icon("Spell_ChargePositive") + "Add one of my alts", SENDER_PARTY_ADD_MENU, party.Id);
+        if (party.Members > 0)
+            AddGossipItemFor(player, GOSSIP_ICON_CHAT, Icon("Spell_ChargeNegative") + "Remove a member", SENDER_PARTY_REMOVE_MENU, party.Id);
+        AddGossipItemFor(player, GOSSIP_ICON_CHAT, Icon("INV_Scroll_03") + "Show its members in chat", SENDER_PARTY_LIST, party.Id);
+        AddGossipItemFor(player, GOSSIP_ICON_CHAT, Icon("Ability_Rogue_FeignDeath") + "Disband this party", SENDER_PARTY_DISBAND, party.Id, "Disband " + party.Name + "? Its members stay autonomous alts.", 0, false);
+        AddGossipItemFor(player, GOSSIP_ICON_CHAT, "Back to all parties", SENDER_PARTY_BACK, 0);
+        SendGossipMenuFor(player, NPC_TEXT_PARTIES, creature->GetGUID());
+    }
+
+    void ShowPartyAddMenu(Player* player, Creature* creature, uint32 id)
+    {
+        PartyEntry party;
+        if (!FindParty(id, party))
+        {
+            ShowPartyList(player, creature);
+            return;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(g_AddMenuMutex);
+            g_AddMenuParty[player->GetGUID().GetCounter()] = id;
+        }
+
+        ClearGossipMenuFor(player);
+        bool any = false;
+        for (AltEntry const& entry : LoadAccountAlts(player, true))
+        {
+            if (!entry.Enabled || entry.PartyId)
+                continue;
+            AddGossipItemFor(player, GOSSIP_ICON_CHAT, AltLabel(entry), SENDER_PARTY_ADD, entry.Guid);
+            any = true;
+        }
+        if (!any)
+            AddGossipItemFor(player, GOSSIP_ICON_CHAT, "None of your alts can join: turn one on first, and it must not be in a party.", SENDER_PARTY_SELECT, id);
+
+        AddGossipItemFor(player, GOSSIP_ICON_CHAT, "Back to " + party.Name, SENDER_PARTY_SELECT, id);
+        SendGossipMenuFor(player, NPC_TEXT_PARTIES, creature->GetGUID());
+    }
+
+    void ShowPartyRemoveMenu(Player* player, Creature* creature, uint32 id)
+    {
+        PartyEntry party;
+        if (!FindParty(id, party))
+        {
+            ShowPartyList(player, creature);
+            return;
+        }
+
+        ClearGossipMenuFor(player);
+        if (QueryResult result = CharacterDatabase.Query(
+                "SELECT c.guid, c.name, c.level, c.class FROM tofu_autoalt_party_member m JOIN characters c ON c.guid = m.guid WHERE m.party_id = {} ORDER BY c.name", id))
+        {
+            do
+            {
+                Field* fields = result->Fetch();
+                std::string const name = fields[1].Get<std::string>();
+                uint8 const cls = fields[3].Get<uint8>();
+                AddGossipItemFor(player, GOSSIP_ICON_CHAT, "|cff" + std::string(GetClassColor(cls)) + name + "|r - Level " + std::to_string(fields[2].Get<uint8>()) + " " + GetClassName(cls), SENDER_PARTY_REMOVE, fields[0].Get<uint32>(), "Take " + name + " out of " + party.Name + "?", 0, false);
+            }
+            while (result->NextRow());
+        }
+
+        AddGossipItemFor(player, GOSSIP_ICON_CHAT, "Back to " + party.Name, SENDER_PARTY_SELECT, id);
+        SendGossipMenuFor(player, NPC_TEXT_PARTIES, creature->GetGUID());
+    }
+
+    std::string CharacterNameByGuid(uint32 guid)
+    {
+        std::string name;
+        if (!sCharacterCache->GetCharacterNameByGuid(ObjectGuid::Create<HighGuid::Player>(guid), name) || !IsSafeCharacterName(name))
+            return "";
+        return name;
+    }
+
+    void ShowXpMenu(Player* player, Creature* creature)
+    {
+        ClearGossipMenuFor(player);
+        AddGossipItemFor(player, GOSSIP_ICON_CHAT, Icon("INV_Misc_Spyglass_02") + "Show my XP rate", SENDER_XP, XP_VIEW);
+        for (uint32 rate : g_Config.xpPresets)
+            AddGossipItemFor(player, GOSSIP_ICON_CHAT, Icon("Spell_Holy_SurgeOfLight") + "Set my XP rate to " + std::to_string(rate) + "x", SENDER_XP_PRESET, rate);
+        AddGossipItemFor(player, GOSSIP_ICON_CHAT, Icon("INV_Misc_Note_01") + "Set a custom XP rate...", SENDER_XP_CUSTOM, 0, "Type your XP rate, for example 4 or 2.5.", 0, true);
+        AddGossipItemFor(player, GOSSIP_ICON_CHAT, Icon("Spell_Holy_Renew") + "Back to the default rate", SENDER_XP, XP_DEFAULT);
+        AddGossipItemFor(player, GOSSIP_ICON_CHAT, Icon("Spell_ChargePositive") + "Gain experience", SENDER_XP, XP_ENABLE);
+        AddGossipItemFor(player, GOSSIP_ICON_CHAT, Icon("Spell_ChargeNegative") + "Stop gaining experience", SENDER_XP, XP_DISABLE, "Stop gaining experience until you turn it back on?", 0, false);
+        AddGossipItemFor(player, GOSSIP_ICON_CHAT, "Back to character services", SENDER_MAIN, ACTION_BACK_TO_MAIN);
+        SendGossipMenuFor(player, NPC_TEXT_XP, creature->GetGUID());
+    }
+
+    // A typed XP rate: digits with at most one decimal point, at most 6 characters.
+    bool IsValidRate(std::string const& text)
+    {
+        if (text.empty() || text.size() > 6)
+            return false;
+        bool dot = false;
+        bool digit = false;
+        for (unsigned char c : text)
+        {
+            if (c == '.')
+            {
+                if (dot)
+                    return false;
+                dot = true;
+            }
+            else if (std::isdigit(c))
+                digit = true;
+            else
+                return false;
+        }
+        return digit;
+    }
+
+    std::string Trim(char const* code)
+    {
+        std::string text = code ? code : "";
+        auto const notSpace = [](unsigned char c) { return !std::isspace(c); };
+        text.erase(text.begin(), std::find_if(text.begin(), text.end(), notSpace));
+        text.erase(std::find_if(text.rbegin(), text.rend(), notSpace).base(), text.end());
+        return text;
+    }
+
+    // Returns true when the sender belongs to one of the command menus.
+    bool HandleCommandSelect(Player* player, Creature* creature, uint32 sender, uint32 action)
+    {
+        switch (sender)
+        {
+            case SENDER_ALT_SELECT:
+            case SENDER_ALT_ON:
+            case SENDER_ALT_OFF:
+            case SENDER_ALT_STATUS:
+            case SENDER_ALT_LIST:
+            {
+                if (!g_Config.autoAlt)
+                {
+                    CloseGossipMenuFor(player);
+                    return true;
+                }
+                if (sender == SENDER_ALT_LIST)
+                {
+                    RunCommand(player, ".autoalt list");
+                    return true;
+                }
+                if (sender == SENDER_ALT_SELECT)
+                {
+                    ShowAltPage(player, creature, action);
+                    return true;
+                }
+                AltEntry entry;
+                if (!FindAccountAlt(player, action, entry) || !IsSafeCharacterName(entry.Name))
+                {
+                    ShowAltList(player, creature);
+                    return true;
+                }
+                char const* sub = sender == SENDER_ALT_ON ? "start" : sender == SENDER_ALT_OFF ? "stop" : "status";
+                RunCommand(player, std::string(".autoalt ") + sub + " " + entry.Name);
+                return true;
+            }
+
+            case SENDER_PARTY_SELECT:
+            case SENDER_PARTY_JOIN:
+            case SENDER_PARTY_ADD_MENU:
+            case SENDER_PARTY_ADD:
+            case SENDER_PARTY_REMOVE_MENU:
+            case SENDER_PARTY_REMOVE:
+            case SENDER_PARTY_DISBAND:
+            case SENDER_PARTY_LIST:
+            case SENDER_PARTY_BACK:
+            {
+                if (!g_Config.autoAlt || !g_Config.autoAltParties)
+                {
+                    CloseGossipMenuFor(player);
+                    return true;
+                }
+
+                PartyEntry party;
+                switch (sender)
+                {
+                    case SENDER_PARTY_SELECT:
+                        ShowPartyPage(player, creature, action);
+                        break;
+                    case SENDER_PARTY_BACK:
+                        ShowPartyList(player, creature);
+                        break;
+                    case SENDER_PARTY_ADD_MENU:
+                        ShowPartyAddMenu(player, creature, action);
+                        break;
+                    case SENDER_PARTY_REMOVE_MENU:
+                        ShowPartyRemoveMenu(player, creature, action);
+                        break;
+                    case SENDER_PARTY_LIST:
+                        if (!action)
+                            RunCommand(player, ".autoalt party list");
+                        else if (FindParty(action, party))
+                            RunCommand(player, ".autoalt party list " + party.Name);
+                        else
+                            ShowPartyList(player, creature);
+                        break;
+                    case SENDER_PARTY_JOIN:
+                    case SENDER_PARTY_DISBAND:
+                        if (FindParty(action, party))
+                            RunCommand(player, std::string(".autoalt party ") + (sender == SENDER_PARTY_JOIN ? "join " : "disband ") + party.Name);
+                        else
+                            ShowPartyList(player, creature);
+                        break;
+                    case SENDER_PARTY_ADD:
+                    {
+                        uint32 partyId = 0;
+                        {
+                            std::lock_guard<std::mutex> lock(g_AddMenuMutex);
+                            auto it = g_AddMenuParty.find(player->GetGUID().GetCounter());
+                            if (it != g_AddMenuParty.end())
+                            {
+                                partyId = it->second;
+                                g_AddMenuParty.erase(it);
+                            }
+                        }
+                        AltEntry entry;
+                        if (partyId && FindParty(partyId, party) && FindAccountAlt(player, action, entry) && IsSafeCharacterName(entry.Name))
+                            RunCommand(player, ".autoalt party add " + party.Name + " " + entry.Name);
+                        else
+                            ShowPartyList(player, creature);
+                        break;
+                    }
+                    case SENDER_PARTY_REMOVE:
+                    {
+                        std::string const name = CharacterNameByGuid(action);
+                        if (!name.empty())
+                            RunCommand(player, ".autoalt party remove " + name);
+                        else
+                            ShowPartyList(player, creature);
+                        break;
+                    }
+                    default:
+                        break;
+                }
+                return true;
+            }
+
+            case SENDER_XP:
+            case SENDER_XP_PRESET:
+            {
+                if (!g_Config.xp)
+                {
+                    CloseGossipMenuFor(player);
+                    return true;
+                }
+                if (sender == SENDER_XP_PRESET)
+                {
+                    if (std::find(g_Config.xpPresets.begin(), g_Config.xpPresets.end(), action) != g_Config.xpPresets.end())
+                        RunCommand(player, ".xp set " + std::to_string(action));
+                    else
+                        ShowXpMenu(player, creature);
+                    return true;
+                }
+                switch (action)
+                {
+                    case XP_VIEW:    RunCommand(player, ".xp view"); break;
+                    case XP_DEFAULT: RunCommand(player, ".xp default"); break;
+                    case XP_ENABLE:  RunCommand(player, ".xp enable"); break;
+                    case XP_DISABLE: RunCommand(player, ".xp disable"); break;
+                    default:         ShowXpMenu(player, creature); break;
+                }
+                return true;
+            }
+
+            default:
+                return false;
+        }
+    }
+
+    // Options with a text box (party name, custom XP rate).
+    void HandleCodedSelect(Player* player, Creature* creature, uint32 sender, char const* code)
+    {
+        std::string const text = Trim(code);
+
+        if (sender == SENDER_PARTY_CREATE && g_Config.autoAlt && g_Config.autoAltParties)
+        {
+            if (!IsValidPartyName(text))
+            {
+                Notify(player, "A party name is 1 to 32 letters, digits, - or _.");
+                ShowPartyList(player, creature);
+                return;
+            }
+            RunCommand(player, ".autoalt party create " + text);
+            return;
+        }
+
+        if (sender == SENDER_XP_CUSTOM && g_Config.xp)
+        {
+            if (!IsValidRate(text))
+            {
+                Notify(player, "Type a number, for example 4 or 2.5.");
+                ShowXpMenu(player, creature);
+                return;
+            }
+            RunCommand(player, ".xp set " + text);
+            return;
+        }
+
+        CloseGossipMenuFor(player);
+    }
+
+    // ---------------------------------------------------------------------------------------------------------
     // Main menu
     // ---------------------------------------------------------------------------------------------------------
 
@@ -658,6 +1254,18 @@ namespace
 
             if (g_Config.leaveCombat && player->IsInCombat())
                 AddGossipItemFor(player, GOSSIP_ICON_CHAT, Icon("Achievement_BG_AB_defendflags") + "Leave combat", SENDER_MAIN, ACTION_LEAVE_COMBAT);
+
+            if (g_Config.autoAlt)
+                AddGossipItemFor(player, GOSSIP_ICON_CHAT, Icon("Spell_Holy_PrayerOfSpirit") + "Autonomous alts", SENDER_MAIN, ACTION_ALTS);
+            if (g_Config.autoAlt && g_Config.autoAltParties)
+                AddGossipItemFor(player, GOSSIP_ICON_CHAT, Icon("INV_Misc_GroupNeedMore") + "Alt parties", SENDER_MAIN, ACTION_PARTIES);
+            if (g_Config.aoeLoot)
+            {
+                AddGossipItemFor(player, GOSSIP_ICON_CHAT, Icon("INV_Misc_Bag_10") + "Turn AoE loot on", SENDER_MAIN, ACTION_AOE_ON);
+                AddGossipItemFor(player, GOSSIP_ICON_CHAT, Icon("INV_Misc_Bag_10_Black") + "Turn AoE loot off", SENDER_MAIN, ACTION_AOE_OFF);
+            }
+            if (g_Config.xp)
+                AddGossipItemFor(player, GOSSIP_ICON_CHAT, Icon("Spell_Holy_SurgeOfLight") + "My XP rate", SENDER_MAIN, ACTION_XP);
         }
 
         AddGossipItemFor(player, GOSSIP_ICON_CHAT, "Goodbye", SENDER_MAIN, ACTION_GOODBYE);
@@ -675,7 +1283,29 @@ public:
         if (!player || !creature)
             return true;
 
+        // Bots never get a menu.
+        if (player->GetSession()->IsHeadless())
+        {
+            CloseGossipMenuFor(player);
+            return true;
+        }
+
         ShowMainMenu(player, creature);
+        return true;
+    }
+
+    bool OnGossipSelectCode(Player* player, Creature* creature, uint32 sender, uint32 /*action*/, char const* code) override
+    {
+        if (!player || !creature)
+            return true;
+
+        if (!g_Config.enable || player->GetSession()->IsHeadless())
+        {
+            CloseGossipMenuFor(player);
+            return true;
+        }
+
+        HandleCodedSelect(player, creature, sender, code);
         return true;
     }
 
@@ -684,10 +1314,22 @@ public:
         if (!player || !creature)
             return true;
 
+        if (player->GetSession()->IsHeadless())
+        {
+            CloseGossipMenuFor(player);
+            return true;
+        }
+
         if (sender != SENDER_MAIN)
         {
-            if (!g_Config.enable || !HandleOrderSelect(player, creature, sender, action))
+            if (!g_Config.enable || (!HandleOrderSelect(player, creature, sender, action) && !HandleCommandSelect(player, creature, sender, action)))
                 CloseGossipMenuFor(player);
+            return true;
+        }
+
+        if (!g_Config.enable && action != ACTION_GOODBYE)
+        {
+            CloseGossipMenuFor(player);
             return true;
         }
 
@@ -712,6 +1354,31 @@ public:
                 break;
             case ACTION_BACK_TO_MAIN:
                 ShowMainMenu(player, creature);
+                break;
+            case ACTION_ALTS:
+                if (g_Config.autoAlt)
+                    ShowAltList(player, creature);
+                else
+                    CloseGossipMenuFor(player);
+                break;
+            case ACTION_PARTIES:
+                if (g_Config.autoAlt && g_Config.autoAltParties)
+                    ShowPartyList(player, creature);
+                else
+                    CloseGossipMenuFor(player);
+                break;
+            case ACTION_AOE_ON:
+            case ACTION_AOE_OFF:
+                if (g_Config.aoeLoot)
+                    RunCommand(player, action == ACTION_AOE_ON ? ".aoeloot on" : ".aoeloot off");
+                else
+                    CloseGossipMenuFor(player);
+                break;
+            case ACTION_XP:
+                if (g_Config.xp)
+                    ShowXpMenu(player, creature);
+                else
+                    CloseGossipMenuFor(player);
                 break;
             default:
                 CloseGossipMenuFor(player);
@@ -778,7 +1445,7 @@ public:
     void OnAfterConfigLoad(bool /*reload*/) override
     {
         LoadConfig();
-        LOG_INFO("module", "mod-tofu-character-services: {} (name {}c, race {}c, faction {}c, leave combat {}, .charorder {}).", g_Config.enable ? "enabled" : "disabled", g_Config.renameCost, g_Config.raceCost, g_Config.factionCost, g_Config.leaveCombat ? "on" : "off", g_Config.command ? "on" : "off");
+        LOG_INFO("module", "mod-tofu-character-services: {} (name {}c, race {}c, faction {}c, leave combat {}, .charorder {}, autoalt {}, parties {}, aoeloot {}, xp {} with {} preset(s)).", g_Config.enable ? "enabled" : "disabled", g_Config.renameCost, g_Config.raceCost, g_Config.factionCost, g_Config.leaveCombat ? "on" : "off", g_Config.command ? "on" : "off", g_Config.autoAlt ? "on" : "off", g_Config.autoAltParties ? "on" : "off", g_Config.aoeLoot ? "on" : "off", g_Config.xp ? "on" : "off", g_Config.xpPresets.size());
     }
 };
 

@@ -5,7 +5,9 @@
 ########################################
 #
 # Archivist Ellery Ashby <Character Services> (creature 900042, place with .npc add 900042): arrange the account's
-# characters, change name, change race, change faction, and leave combat. Bots never get these services.
+# characters, change name, change race, change faction, and leave combat, plus menus for the player commands of
+# mod-autonomous-altbots (.autoalt), mod-aoe-loot (.aoeloot), and mod-individual-xp (.xp), each with its own key
+# below. Bots never get these services.
 #
 #    TofuCharServices.Enable
 #        Description: Turn the module on. While off, the NPC only says goodbye and .charorder is refused.
@@ -47,3 +49,42 @@ TofuCharServices.LeaveCombat.Enable = 1
 #        Default:     50
 
 TofuCharServices.LeaveCombat.Range = 50
+
+#    TofuCharServices.AutoAlt.Enable
+#        Description: Show "Autonomous alts": the account's other characters marked on or off, each with Turn on,
+#                     Turn off, and Show status, which run .autoalt start, stop, and status for that character.
+#                     Needs mod-autonomous-altbots in the build (the menu reads its character_settings rows).
+#        Default:     0 - Off
+#                     1 - On
+
+TofuCharServices.AutoAlt.Enable = 0
+
+#    TofuCharServices.AutoAlt.Parties
+#        Description: Also show "Alt parties": create, join, add, remove, disband, and list (.autoalt party ...).
+#                     Needs AutoAlt.Enable = 1, and AutonomousAltBots.Party.Enable = 1 in mod_autonomous_altbots.conf
+#                     (the menu reads tofu_autoalt_party and tofu_autoalt_party_member).
+#        Default:     0 - Off
+#                     1 - On
+
+TofuCharServices.AutoAlt.Parties = 0
+
+#    TofuCharServices.AoeLoot.Enable
+#        Description: Show "Turn AoE loot on" and "Turn AoE loot off" (.aoeloot on, .aoeloot off; mod-aoe-loot).
+#        Default:     0 - Off
+#                     1 - On
+
+TofuCharServices.AoeLoot.Enable = 0
+
+#    TofuCharServices.Xp.Enable
+#        Description: Show "My XP rate": view, presets, a custom rate, default, enable, and disable (.xp ...;
+#                     mod-individual-xp). That module still applies IndividualXp.MaxXPRate and its challenge locks.
+#        Default:     0 - Off
+#                     1 - On
+
+TofuCharServices.Xp.Enable = 0
+
+#    TofuCharServices.Xp.Presets
+#        Description: XP rates offered as one-click options, whole numbers separated by spaces (at most 10).
+#        Default:     "1 2 3 5 10 20"
+
+TofuCharServices.Xp.Presets = "1 2 3 5 10 20"
