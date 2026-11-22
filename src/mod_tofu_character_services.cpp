@@ -11,7 +11,8 @@
  *   and the core's CharacterHandler does the conversion.
  * - Leave combat: ends the player's combat state outside instances when nothing alive is attacking nearby.
  * - Menus for other modules' player commands: Autonomous alts and Alt parties (.autoalt, mod-autonomous-altbots),
- *   AoE loot (.aoeloot, mod-aoe-loot), and XP rate (.xp, mod-individual-xp). Each option runs the real command for
+ *   AoE loot (.aoeloot, mod-aoe-loot), XP rate (.xp, mod-individual-xp), and the per-character Realm First opt-out
+ *   (.realmfirst optout, Tofu fork of mod-realm-first-titles). Each option runs the real command for
  *   the player through ChatHandler::ParseCommands, exactly as if it were typed, so every check, permission, lock, and
  *   reply of those modules applies unchanged and this module does not link against them. Typed input (a party name,
  *   an XP rate) comes from the gossip text box and is validated before it is put into a command. State shown in the
@@ -58,6 +59,10 @@ namespace
 
     // mod-autonomous-altbots stores each character's on/off choice in this player setting (read only here).
     constexpr char AUTOALT_SETTING_SOURCE[] = "mod_autonomous_altbots";
+
+    // The Tofu realm-first fork stores the character's opt-out in this player setting (1 = opted out; read only here).
+    constexpr char REALM_FIRST_SETTING_SOURCE[] = "mod-realm-first-titles";
+    constexpr uint8 REALM_FIRST_SETTING_INDEX = 0;
     constexpr std::size_t PARTY_NAME_MAX_LENGTH = 32;
     constexpr std::size_t MAX_LIST_OPTIONS = 30;
 
@@ -81,6 +86,8 @@ namespace
     constexpr uint32 ACTION_AOE_ON = 11;
     constexpr uint32 ACTION_AOE_OFF = 12;
     constexpr uint32 ACTION_XP = 13;
+    constexpr uint32 ACTION_REALM_FIRST_OFF = 14;
+    constexpr uint32 ACTION_REALM_FIRST_ON = 15;
 
     // Autonomous alts (action = character GUID unless noted).
     constexpr uint32 SENDER_ALT_SELECT = 0x54430010;
@@ -140,6 +147,7 @@ namespace
         bool aoeLoot = false;
         bool xp = false;
         std::vector<uint32> xpPresets;
+        bool realmFirst = false;
     };
 
     ModuleConfig g_Config;
@@ -178,6 +186,7 @@ namespace
         g_Config.autoAltParties = sConfigMgr->GetOption<bool>("TofuCharServices.AutoAlt.Parties", false);
         g_Config.aoeLoot = sConfigMgr->GetOption<bool>("TofuCharServices.AoeLoot.Enable", false);
         g_Config.xp = sConfigMgr->GetOption<bool>("TofuCharServices.Xp.Enable", false);
+        g_Config.realmFirst = sConfigMgr->GetOption<bool>("TofuCharServices.RealmFirst.Enable", false);
         g_Config.xpPresets = ParsePresets(sConfigMgr->GetOption<std::string>("TofuCharServices.Xp.Presets", "1 2 3 5 10 20"));
     }
 
@@ -1266,6 +1275,14 @@ namespace
             }
             if (g_Config.xp)
                 AddGossipItemFor(player, GOSSIP_ICON_CHAT, Icon("Spell_Holy_SurgeOfLight") + "My XP rate", SENDER_MAIN, ACTION_XP);
+
+            if (g_Config.realmFirst)
+            {
+                if (player->GetPlayerSetting(REALM_FIRST_SETTING_SOURCE, REALM_FIRST_SETTING_INDEX).value)
+                    AddGossipItemFor(player, GOSSIP_ICON_CHAT, Icon("Achievement_General") + "Realm First achievements: |cff7A1E1Eoff|r for this character. Turn them back on", SENDER_MAIN, ACTION_REALM_FIRST_ON, "Let this character earn Realm First achievements again? Only new progress counts: a Realm First it would have earned while they were off is not granted.", 0, false);
+                else
+                    AddGossipItemFor(player, GOSSIP_ICON_CHAT, Icon("Achievement_General") + "Realm First achievements: |cff1E7A1Eon|r for this character. Turn them off", SENDER_MAIN, ACTION_REALM_FIRST_OFF, "Stop this character from earning Realm First achievements, so they stay open for others? Realm Firsts it already holds are kept.", 0, false);
+            }
         }
 
         AddGossipItemFor(player, GOSSIP_ICON_CHAT, "Goodbye", SENDER_MAIN, ACTION_GOODBYE);
@@ -1380,6 +1397,13 @@ public:
                 else
                     CloseGossipMenuFor(player);
                 break;
+            case ACTION_REALM_FIRST_OFF:
+            case ACTION_REALM_FIRST_ON:
+                if (g_Config.realmFirst)
+                    RunCommand(player, action == ACTION_REALM_FIRST_OFF ? ".realmfirst optout on" : ".realmfirst optout off");
+                else
+                    CloseGossipMenuFor(player);
+                break;
             default:
                 CloseGossipMenuFor(player);
                 break;
@@ -1445,7 +1469,7 @@ public:
     void OnAfterConfigLoad(bool /*reload*/) override
     {
         LoadConfig();
-        LOG_INFO("module", "mod-tofu-character-services: {} (name {}c, race {}c, faction {}c, leave combat {}, .charorder {}, autoalt {}, parties {}, aoeloot {}, xp {} with {} preset(s)).", g_Config.enable ? "enabled" : "disabled", g_Config.renameCost, g_Config.raceCost, g_Config.factionCost, g_Config.leaveCombat ? "on" : "off", g_Config.command ? "on" : "off", g_Config.autoAlt ? "on" : "off", g_Config.autoAltParties ? "on" : "off", g_Config.aoeLoot ? "on" : "off", g_Config.xp ? "on" : "off", g_Config.xpPresets.size());
+        LOG_INFO("module", "mod-tofu-character-services: {} (name {}c, race {}c, faction {}c, leave combat {}, .charorder {}, autoalt {}, parties {}, aoeloot {}, xp {} with {} preset(s), realm first {}).", g_Config.enable ? "enabled" : "disabled", g_Config.renameCost, g_Config.raceCost, g_Config.factionCost, g_Config.leaveCombat ? "on" : "off", g_Config.command ? "on" : "off", g_Config.autoAlt ? "on" : "off", g_Config.autoAltParties ? "on" : "off", g_Config.aoeLoot ? "on" : "off", g_Config.xp ? "on" : "off", g_Config.xpPresets.size(), g_Config.realmFirst ? "on" : "off");
     }
 };
 

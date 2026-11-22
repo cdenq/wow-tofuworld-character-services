@@ -88,3 +88,12 @@ TofuCharServices.Xp.Enable = 0
 #        Default:     "1 2 3 5 10 20"
 
 TofuCharServices.Xp.Presets = "1 2 3 5 10 20"
+
+#    TofuCharServices.RealmFirst.Enable
+#        Description: Show "Realm First achievements: on/off for this character", which runs .realmfirst optout on or
+#                     off for the current character (Tofu fork of mod-realm-first-titles). That module must also have
+#                     RealmFirstTitles.AllowPlayerOptOut = 1, or the command answers that opting out is turned off.
+#        Default:     0 - Off
+#                     1 - On
+
+TofuCharServices.RealmFirst.Enable = 0

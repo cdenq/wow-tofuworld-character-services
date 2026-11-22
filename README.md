@@ -11,8 +11,9 @@ An AzerothCore module for Tofu Worldview (mod-playerbots fork of azerothcore-wot
 7. **Alt parties**: every party with its member count; create, join and lead, add one of your alts, remove a member, disband, or list (`.autoalt party ...`).
 8. **Turn AoE loot on / off** (`.aoeloot on|off`).
 9. **My XP rate**: show it, one-click presets, a custom rate, default, gain or stop gaining XP (`.xp view|set|default|enable|disable`).
+10. **Realm First achievements on/off for this character** (`.realmfirst optout on|off`, Tofu fork of mod-realm-first-titles with `RealmFirstTitles.AllowPlayerOptOut = 1`). Off keeps the Realm Firsts the character already holds and leaves new ones open for others; turning it back on counts only new progress.
 
-Sections 6 to 9 each have their own settings key and are off by default.
+Sections 6 to 10 each have their own settings key and are off by default.
 
 While a name, race, or faction change is waiting, the menu shows **Cancel my pending change** instead, which refunds what you paid. Bots cannot use the services.
 
@@ -22,7 +23,7 @@ While a name, race, or faction change is waiting, the menu shows **Cancel my pen
 - Name, race, and faction change set the core's at-login flags (`AT_LOGIN_RENAME`, `AT_LOGIN_CHANGE_RACE`, `AT_LOGIN_CHANGE_FACTION`), the same flags as `.character rename`, `.character changerace`, and `.character changefaction`. The core's own character screen handlers then do the conversion (items, spells, reputations, titles, and quests through the stock `player_factionchange_*` tables).
 - What was paid for the pending change is kept in the player setting `mod-tofu-character-services` index 0 (`character_settings`, needs `EnablePlayerSettings = 1`).
 - Bots are recognized by their headless session, so the module does not depend on mod-playerbots.
-- Sections 6 to 9 run the real player command for you through `ChatHandler::ParseCommands`, the same path as typing it, so each module's checks, permissions, challenge locks, and replies apply unchanged, and this module does not link against those modules. Typed input (a party name, an XP rate) comes from the dialog's text box and is validated before it goes into a command. The menus read state with SELECTs only: `character_settings` source `mod_autonomous_altbots` index 0, `tofu_autoalt_party`, and `tofu_autoalt_party_member`.
+- Sections 6 to 10 run the real player command for you through `ChatHandler::ParseCommands`, the same path as typing it, so each module's checks, permissions, challenge locks, and replies apply unchanged, and this module does not link against those modules. Typed input (a party name, an XP rate) comes from the dialog's text box and is validated before it goes into a command. The menus read state with SELECTs only: `character_settings` source `mod_autonomous_altbots` index 0, `tofu_autoalt_party`, `tofu_autoalt_party_member`, and the player setting `mod-realm-first-titles` index 0.
 - If one of those modules renames a command or subcommand, its menu here must change the same way.
 
 ## Install
