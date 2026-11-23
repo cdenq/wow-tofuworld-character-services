@@ -69,29 +69,25 @@ TofuCharServices.AutoAlt.Enable = 0
 TofuCharServices.AutoAlt.Parties = 0
 
 #    TofuCharServices.AoeLoot.Enable
-#        Description: Show "Turn AoE loot on" and "Turn AoE loot off" (.aoeloot on, .aoeloot off; mod-aoe-loot).
+#        Description: Show "Toggle AoE loot: ON/OFF" (.aoeloot on, .aoeloot off; mod-aoe-loot). The state shown is the
+#                     player setting mod-aoe-loot index 0 that the Tofu mod-aoe-loot fork keeps, so it needs that fork.
 #        Default:     0 - Off
 #                     1 - On
 
 TofuCharServices.AoeLoot.Enable = 0
 
 #    TofuCharServices.Xp.Enable
-#        Description: Show "My XP rate": view, presets, a custom rate, default, enable, and disable (.xp ...;
-#                     mod-individual-xp). That module still applies IndividualXp.MaxXPRate and its challenge locks.
+#        Description: Show "My XP rate": show my rate (.xp view), a custom rate from 1 to 20 (.xp set), and reset back
+#                     to 1 (.xp default; mod-individual-xp). That module still applies IndividualXp.MaxXPRate and its
+#                     challenge locks.
 #        Default:     0 - Off
 #                     1 - On
 
 TofuCharServices.Xp.Enable = 0
 
-#    TofuCharServices.Xp.Presets
-#        Description: XP rates offered as one-click options, whole numbers separated by spaces (at most 10).
-#        Default:     "1 2 3 5 10 20"
-
-TofuCharServices.Xp.Presets = "1 2 3 5 10 20"
-
 #    TofuCharServices.RealmFirst.Enable
-#        Description: Show "Realm First achievements: on/off for this character", which runs .realmfirst optout on or
-#                     off for the current character (Tofu fork of mod-realm-first-titles). That module must also have
+#        Description: Show "Toggle Realm First achievement eligibility: ON/OFF", which runs .realmfirst optout on or
+#                     off for the current character and then shows the new state on screen (Tofu fork of mod-realm-first-titles). That module must also have
 #                     RealmFirstTitles.AllowPlayerOptOut = 1, or the command answers that opting out is turned off.
 #        Default:     0 - Off
 #                     1 - On

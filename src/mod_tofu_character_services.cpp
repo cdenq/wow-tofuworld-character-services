@@ -16,13 +16,15 @@
  *   the player through ChatHandler::ParseCommands, exactly as if it were typed, so every check, permission, lock, and
  *   reply of those modules applies unchanged and this module does not link against them. Typed input (a party name,
  *   an XP rate) comes from the gossip text box and is validated before it is put into a command. State shown in the
- *   menus (which characters are autonomous alts, which parties exist) is read with SELECTs only.
+ *   menus (which characters are autonomous alts, which parties exist) is read with SELECTs only, and the AoE loot and
+ *   Realm First toggles read the player settings those modules keep (mod-aoe-loot needs the Tofu fork for that).
  * Menu style after azerothcore/mod-npc-services (inline icons on each option); no code is copied from it.
  *
  * Bots never get these services: every playerbot session is headless (no socket), so WorldSession::IsHeadless()
  * identifies them without depending on mod-playerbots.
  */
 
+#include "AccountMgr.h"
 #include "AuctionHouseMgr.h"
 #include "CharacterCache.h"
 #include "Chat.h"
@@ -31,12 +33,14 @@
 #include "DatabaseEnv.h"
 #include "Log.h"
 #include "Map.h"
+#include "ObjectAccessor.h"
 #include "Player.h"
 #include "ScriptMgr.h"
 #include "ScriptedGossip.h"
 #include "WorldSession.h"
 
 #include <algorithm>
+#include <map>
 #include <cctype>
 #include <cstdlib>
 #include <iterator>
@@ -63,6 +67,9 @@ namespace
     // The Tofu realm-first fork stores the character's opt-out in this player setting (1 = opted out; read only here).
     constexpr char REALM_FIRST_SETTING_SOURCE[] = "mod-realm-first-titles";
     constexpr uint8 REALM_FIRST_SETTING_INDEX = 0;
+    // The Tofu mod-aoe-loot fork stores the character's .aoeloot choice in this player setting (1 = off; read only here).
+    constexpr char AOE_LOOT_SETTING_SOURCE[] = "mod-aoe-loot";
+    constexpr uint8 AOE_LOOT_SETTING_INDEX = 0;
     constexpr std::size_t PARTY_NAME_MAX_LENGTH = 32;
     constexpr std::size_t MAX_LIST_OPTIONS = 30;
 
@@ -95,6 +102,7 @@ namespace
     constexpr uint32 SENDER_ALT_OFF = 0x54430012;
     constexpr uint32 SENDER_ALT_STATUS = 0x54430013;
     constexpr uint32 SENDER_ALT_LIST = 0x54430014;      // action 0: .autoalt list
+    constexpr uint32 SENDER_ALT_GLOBAL = 0x54430015;    // read-only list of every autonomous alt on the realm
 
     // Alt parties (action = party id unless noted).
     constexpr uint32 SENDER_PARTY_SELECT = 0x54430020;
@@ -108,14 +116,13 @@ namespace
     constexpr uint32 SENDER_PARTY_LIST = 0x54430028;    // action 0: every party; otherwise that party
     constexpr uint32 SENDER_PARTY_BACK = 0x54430029;    // action 0: back to the party list
 
-    // XP rate (action = rate for presets).
+    // XP rate.
     constexpr uint32 SENDER_XP = 0x54430030;
-    constexpr uint32 SENDER_XP_PRESET = 0x54430031;
     constexpr uint32 SENDER_XP_CUSTOM = 0x54430032;     // coded: the typed rate
     constexpr uint32 XP_VIEW = 1;
     constexpr uint32 XP_DEFAULT = 2;
-    constexpr uint32 XP_ENABLE = 3;
-    constexpr uint32 XP_DISABLE = 4;
+    constexpr float XP_RATE_MIN = 1.0f;
+    constexpr float XP_RATE_MAX = 20.0f;
 
     constexpr uint32 CHARACTER_ORDER_SENDER_SELECT = 0x434F0001;
     constexpr uint32 CHARACTER_ORDER_SENDER_SELECTED = 0x434F0002;
@@ -146,7 +153,6 @@ namespace
         bool autoAltParties = false;
         bool aoeLoot = false;
         bool xp = false;
-        std::vector<uint32> xpPresets;
         bool realmFirst = false;
     };
 
@@ -156,22 +162,6 @@ namespace
     // update threads, so access is locked.
     std::mutex g_AddMenuMutex;
     std::unordered_map<uint32, uint32> g_AddMenuParty;
-
-    std::vector<uint32> ParsePresets(std::string const& text)
-    {
-        std::vector<uint32> presets;
-        std::istringstream stream(text);
-        std::string token;
-        while (stream >> token)
-        {
-            if (token.empty() || !std::all_of(token.begin(), token.end(), [](unsigned char c) { return std::isdigit(c); }) || token.size() > 4)
-                continue;
-            uint32 const value = uint32(std::strtoul(token.c_str(), nullptr, 10));
-            if (value && std::find(presets.begin(), presets.end(), value) == presets.end() && presets.size() < 10)
-                presets.push_back(value);
-        }
-        return presets;
-    }
 
     void LoadConfig()
     {
@@ -187,7 +177,6 @@ namespace
         g_Config.aoeLoot = sConfigMgr->GetOption<bool>("TofuCharServices.AoeLoot.Enable", false);
         g_Config.xp = sConfigMgr->GetOption<bool>("TofuCharServices.Xp.Enable", false);
         g_Config.realmFirst = sConfigMgr->GetOption<bool>("TofuCharServices.RealmFirst.Enable", false);
-        g_Config.xpPresets = ParsePresets(sConfigMgr->GetOption<std::string>("TofuCharServices.Xp.Presets", "1 2 3 5 10 20"));
     }
 
     std::string Icon(char const* name)
@@ -720,6 +709,18 @@ namespace
     // Other modules' player commands
     // ---------------------------------------------------------------------------------------------------------
 
+    // AoE loot is on unless the character turned it off (mod-aoe-loot's own default with no row).
+    bool AoeLootOn(Player* player)
+    {
+        return player->GetPlayerSetting(AOE_LOOT_SETTING_SOURCE, AOE_LOOT_SETTING_INDEX).value == 0;
+    }
+
+    // Eligible for Realm Firsts unless the character opted out.
+    bool RealmFirstEligible(Player* player)
+    {
+        return player->GetPlayerSetting(REALM_FIRST_SETTING_SOURCE, REALM_FIRST_SETTING_INDEX).value == 0;
+    }
+
     // Runs a player command exactly as if the player had typed it (".xp view" and so on). The command's own
     // module checks permissions and replies in the player's chat.
     void RunCommand(Player* player, std::string const& command)
@@ -831,8 +832,74 @@ namespace
             AddGossipItemFor(player, GOSSIP_ICON_CHAT, AltLabel(entry), SENDER_ALT_SELECT, entry.Guid);
 
         AddGossipItemFor(player, GOSSIP_ICON_CHAT, Icon("INV_Scroll_03") + "Show all my alts in chat", SENDER_ALT_LIST, 0);
+        AddGossipItemFor(player, GOSSIP_ICON_CHAT, Icon("INV_Misc_Book_09") + "Show every autonomous alt on the realm", SENDER_ALT_GLOBAL, 0);
         AddGossipItemFor(player, GOSSIP_ICON_CHAT, "Back to character services", SENDER_MAIN, ACTION_BACK_TO_MAIN);
         SendGossipMenuFor(player, NPC_TEXT_ALTS, creature->GetGUID());
+    }
+
+    // Read-only: every character on any account whose autonomous alt setting is on (the set .autoalt list shows a GM),
+    // with whether it is in the world now and the account it belongs to. Nothing here can change an alt.
+    void ShowGlobalAltList(Player* player, Creature* creature)
+    {
+        struct GlobalAlt
+        {
+            uint32 Guid;
+            std::string Name;
+            uint8 Level;
+            uint8 Class;
+            uint32 Account;
+        };
+
+        std::vector<GlobalAlt> alts;
+        if (QueryResult result = CharacterDatabase.Query(
+            "SELECT c.guid, c.name, c.level, c.class, c.account, s.data FROM character_settings s "
+            "JOIN characters c ON c.guid = s.guid "
+            "WHERE s.source = '" + std::string(AUTOALT_SETTING_SOURCE) + "' AND c.deleteInfos_Name IS NULL "
+            "ORDER BY c.name"))
+        {
+            do
+            {
+                Field* fields = result->Fetch();
+                if (SettingValue(fields[5].Get<std::string>(), 0) == 0)
+                    continue;
+                alts.push_back({ fields[0].Get<uint32>(), fields[1].Get<std::string>(), fields[2].Get<uint8>(), fields[3].Get<uint8>(), fields[4].Get<uint32>() });
+            }
+            while (result->NextRow());
+        }
+
+        ClearGossipMenuFor(player);
+        uint32 online = 0;
+        for (GlobalAlt const& alt : alts)
+            if (Player* bot = ObjectAccessor::FindPlayerByLowGUID(alt.Guid))
+                if (bot->IsInWorld())
+                    ++online;
+
+        AddGossipItemFor(player, GOSSIP_ICON_CHAT, "Autonomous alts on the realm: " + std::to_string(alts.size()) + " on, " + std::to_string(online) + " in the world now", SENDER_ALT_GLOBAL, 0);
+
+        // The client shows at most 32 options: the header, up to MAX_LIST_OPTIONS - 2 alts, an overflow line, and Back.
+        std::size_t const shownMax = MAX_LIST_OPTIONS - 2;
+        std::map<uint32, std::string> accountNames;
+        for (std::size_t i = 0; i < alts.size() && i < shownMax; ++i)
+        {
+            GlobalAlt const& alt = alts[i];
+            auto it = accountNames.find(alt.Account);
+            if (it == accountNames.end())
+            {
+                std::string name;
+                if (!AccountMgr::GetName(alt.Account, name))
+                    name = "unknown account";
+                it = accountNames.emplace(alt.Account, name).first;
+            }
+
+            Player* bot = ObjectAccessor::FindPlayerByLowGUID(alt.Guid);
+            bool const inWorld = bot && bot->IsInWorld();
+            AddGossipItemFor(player, GOSSIP_ICON_CHAT, "|cff" + std::string(GetClassColor(alt.Class)) + alt.Name + "|r - Level " + std::to_string(alt.Level) + " " + GetClassName(alt.Class) + (inWorld ? " - |cff1E7A1Eonline|r" : " - |cff7A1E1Eoffline|r") + " - " + it->second, SENDER_ALT_GLOBAL, 0);
+        }
+        if (alts.size() > shownMax)
+            AddGossipItemFor(player, GOSSIP_ICON_CHAT, "...and " + std::to_string(alts.size() - shownMax) + " more", SENDER_ALT_GLOBAL, 0);
+
+        AddGossipItemFor(player, GOSSIP_ICON_CHAT, "Back to my alts", SENDER_MAIN, ACTION_ALTS);
+        SendGossipMenuFor(player, NPC_TEXT_MAIN, creature->GetGUID());
     }
 
     void ShowAltPage(Player* player, Creature* creature, uint32 guid)
@@ -1006,21 +1073,15 @@ namespace
     {
         ClearGossipMenuFor(player);
         AddGossipItemFor(player, GOSSIP_ICON_CHAT, Icon("INV_Misc_Spyglass_02") + "Show my XP rate", SENDER_XP, XP_VIEW);
-        for (uint32 rate : g_Config.xpPresets)
-            AddGossipItemFor(player, GOSSIP_ICON_CHAT, Icon("Spell_Holy_SurgeOfLight") + "Set my XP rate to " + std::to_string(rate) + "x", SENDER_XP_PRESET, rate);
-        AddGossipItemFor(player, GOSSIP_ICON_CHAT, Icon("INV_Misc_Note_01") + "Set a custom XP rate...", SENDER_XP_CUSTOM, 0, "Type your XP rate, for example 4 or 2.5.", 0, true);
-        AddGossipItemFor(player, GOSSIP_ICON_CHAT, Icon("Spell_Holy_Renew") + "Back to the default rate", SENDER_XP, XP_DEFAULT);
-        AddGossipItemFor(player, GOSSIP_ICON_CHAT, Icon("Spell_ChargePositive") + "Gain experience", SENDER_XP, XP_ENABLE);
-        AddGossipItemFor(player, GOSSIP_ICON_CHAT, Icon("Spell_ChargeNegative") + "Stop gaining experience", SENDER_XP, XP_DISABLE, "Stop gaining experience until you turn it back on?", 0, false);
+        AddGossipItemFor(player, GOSSIP_ICON_CHAT, Icon("INV_Misc_Note_01") + "Set a custom XP rate (1-20)...", SENDER_XP_CUSTOM, 0, "Type your XP rate from 1 to 20, for example 4 or 2.5.", 0, true);
+        AddGossipItemFor(player, GOSSIP_ICON_CHAT, Icon("Spell_Holy_Renew") + "Reset my XP rate back to 1", SENDER_XP, XP_DEFAULT);
         AddGossipItemFor(player, GOSSIP_ICON_CHAT, "Back to character services", SENDER_MAIN, ACTION_BACK_TO_MAIN);
         SendGossipMenuFor(player, NPC_TEXT_XP, creature->GetGUID());
     }
 
-    // A typed XP rate: digits with at most one decimal point, at most 6 characters.
-    bool IsValidRate(std::string const& text)
+    // Digits with at most one decimal point.
+    bool IsRateText(std::string const& text)
     {
-        if (text.empty() || text.size() > 6)
-            return false;
         bool dot = false;
         bool digit = false;
         for (unsigned char c : text)
@@ -1037,6 +1098,17 @@ namespace
                 return false;
         }
         return digit;
+    }
+
+    // A typed XP rate: digits with at most one decimal point, at most 6 characters, from XP_RATE_MIN to XP_RATE_MAX.
+    bool IsValidRate(std::string const& text)
+    {
+        if (text.empty() || text.size() > 6)
+            return false;
+        if (!IsRateText(text))
+            return false;
+        float const rate = std::strtof(text.c_str(), nullptr);
+        return rate >= XP_RATE_MIN && rate <= XP_RATE_MAX;
     }
 
     std::string Trim(char const* code)
@@ -1058,10 +1130,16 @@ namespace
             case SENDER_ALT_OFF:
             case SENDER_ALT_STATUS:
             case SENDER_ALT_LIST:
+            case SENDER_ALT_GLOBAL:
             {
                 if (!g_Config.autoAlt)
                 {
                     CloseGossipMenuFor(player);
+                    return true;
+                }
+                if (sender == SENDER_ALT_GLOBAL)
+                {
+                    ShowGlobalAltList(player, creature);
                     return true;
                 }
                 if (sender == SENDER_ALT_LIST)
@@ -1166,27 +1244,16 @@ namespace
             }
 
             case SENDER_XP:
-            case SENDER_XP_PRESET:
             {
                 if (!g_Config.xp)
                 {
                     CloseGossipMenuFor(player);
                     return true;
                 }
-                if (sender == SENDER_XP_PRESET)
-                {
-                    if (std::find(g_Config.xpPresets.begin(), g_Config.xpPresets.end(), action) != g_Config.xpPresets.end())
-                        RunCommand(player, ".xp set " + std::to_string(action));
-                    else
-                        ShowXpMenu(player, creature);
-                    return true;
-                }
                 switch (action)
                 {
                     case XP_VIEW:    RunCommand(player, ".xp view"); break;
                     case XP_DEFAULT: RunCommand(player, ".xp default"); break;
-                    case XP_ENABLE:  RunCommand(player, ".xp enable"); break;
-                    case XP_DISABLE: RunCommand(player, ".xp disable"); break;
                     default:         ShowXpMenu(player, creature); break;
                 }
                 return true;
@@ -1218,7 +1285,7 @@ namespace
         {
             if (!IsValidRate(text))
             {
-                Notify(player, "Type a number, for example 4 or 2.5.");
+                Notify(player, "Type a number from 1 to 20, for example 4 or 2.5.");
                 ShowXpMenu(player, creature);
                 return;
             }
@@ -1270,18 +1337,20 @@ namespace
                 AddGossipItemFor(player, GOSSIP_ICON_CHAT, Icon("INV_Misc_GroupNeedMore") + "Alt parties", SENDER_MAIN, ACTION_PARTIES);
             if (g_Config.aoeLoot)
             {
-                AddGossipItemFor(player, GOSSIP_ICON_CHAT, Icon("INV_Misc_Bag_10") + "Turn AoE loot on", SENDER_MAIN, ACTION_AOE_ON);
-                AddGossipItemFor(player, GOSSIP_ICON_CHAT, Icon("INV_Misc_Bag_10_Black") + "Turn AoE loot off", SENDER_MAIN, ACTION_AOE_OFF);
+                if (AoeLootOn(player))
+                    AddGossipItemFor(player, GOSSIP_ICON_CHAT, Icon("INV_Misc_Bag_10") + "Toggle AoE loot: |cff1E7A1EON|r", SENDER_MAIN, ACTION_AOE_OFF);
+                else
+                    AddGossipItemFor(player, GOSSIP_ICON_CHAT, Icon("INV_Misc_Bag_10_Black") + "Toggle AoE loot: |cff7A1E1EOFF|r", SENDER_MAIN, ACTION_AOE_ON);
             }
             if (g_Config.xp)
                 AddGossipItemFor(player, GOSSIP_ICON_CHAT, Icon("Spell_Holy_SurgeOfLight") + "My XP rate", SENDER_MAIN, ACTION_XP);
 
             if (g_Config.realmFirst)
             {
-                if (player->GetPlayerSetting(REALM_FIRST_SETTING_SOURCE, REALM_FIRST_SETTING_INDEX).value)
-                    AddGossipItemFor(player, GOSSIP_ICON_CHAT, Icon("Achievement_General") + "Realm First achievements: |cff7A1E1Eoff|r for this character. Turn them back on", SENDER_MAIN, ACTION_REALM_FIRST_ON, "Let this character earn Realm First achievements again? Only new progress counts: a Realm First it would have earned while they were off is not granted.", 0, false);
+                if (!RealmFirstEligible(player))
+                    AddGossipItemFor(player, GOSSIP_ICON_CHAT, Icon("Achievement_General") + "Toggle Realm First achievement eligibility: |cff7A1E1EOFF|r", SENDER_MAIN, ACTION_REALM_FIRST_ON, "Let this character earn Realm First achievements again? Only new progress counts: a Realm First it would have earned while they were off is not granted.", 0, false);
                 else
-                    AddGossipItemFor(player, GOSSIP_ICON_CHAT, Icon("Achievement_General") + "Realm First achievements: |cff1E7A1Eon|r for this character. Turn them off", SENDER_MAIN, ACTION_REALM_FIRST_OFF, "Stop this character from earning Realm First achievements, so they stay open for others? Realm Firsts it already holds are kept.", 0, false);
+                    AddGossipItemFor(player, GOSSIP_ICON_CHAT, Icon("Achievement_General") + "Toggle Realm First achievement eligibility: |cff1E7A1EON|r", SENDER_MAIN, ACTION_REALM_FIRST_OFF, "Stop this character from earning Realm First achievements, so they stay open for others? Realm Firsts it already holds are kept.", 0, false);
             }
         }
 
@@ -1387,7 +1456,11 @@ public:
             case ACTION_AOE_ON:
             case ACTION_AOE_OFF:
                 if (g_Config.aoeLoot)
+                {
                     RunCommand(player, action == ACTION_AOE_ON ? ".aoeloot on" : ".aoeloot off");
+                    // Reports the state the command actually left, not the one asked for.
+                    ChatHandler(player->GetSession()).SendNotification(std::string("AoE loot: ") + (AoeLootOn(player) ? "ON" : "OFF"));
+                }
                 else
                     CloseGossipMenuFor(player);
                 break;
@@ -1400,7 +1473,11 @@ public:
             case ACTION_REALM_FIRST_OFF:
             case ACTION_REALM_FIRST_ON:
                 if (g_Config.realmFirst)
+                {
                     RunCommand(player, action == ACTION_REALM_FIRST_OFF ? ".realmfirst optout on" : ".realmfirst optout off");
+                    // Yellow on-screen message with the state the command actually left (it refuses when opt-out is off).
+                    ChatHandler(player->GetSession()).SendNotification(std::string("Realm First achievement eligibility: ") + (RealmFirstEligible(player) ? "ON" : "OFF"));
+                }
                 else
                     CloseGossipMenuFor(player);
                 break;
@@ -1469,7 +1546,7 @@ public:
     void OnAfterConfigLoad(bool /*reload*/) override
     {
         LoadConfig();
-        LOG_INFO("module", "mod-tofu-character-services: {} (name {}c, race {}c, faction {}c, leave combat {}, .charorder {}, autoalt {}, parties {}, aoeloot {}, xp {} with {} preset(s), realm first {}).", g_Config.enable ? "enabled" : "disabled", g_Config.renameCost, g_Config.raceCost, g_Config.factionCost, g_Config.leaveCombat ? "on" : "off", g_Config.command ? "on" : "off", g_Config.autoAlt ? "on" : "off", g_Config.autoAltParties ? "on" : "off", g_Config.aoeLoot ? "on" : "off", g_Config.xp ? "on" : "off", g_Config.xpPresets.size(), g_Config.realmFirst ? "on" : "off");
+        LOG_INFO("module", "mod-tofu-character-services: {} (name {}c, race {}c, faction {}c, leave combat {}, .charorder {}, autoalt {}, parties {}, aoeloot {}, xp {}, realm first {}).", g_Config.enable ? "enabled" : "disabled", g_Config.renameCost, g_Config.raceCost, g_Config.factionCost, g_Config.leaveCombat ? "on" : "off", g_Config.command ? "on" : "off", g_Config.autoAlt ? "on" : "off", g_Config.autoAltParties ? "on" : "off", g_Config.aoeLoot ? "on" : "off", g_Config.xp ? "on" : "off", g_Config.realmFirst ? "on" : "off");
     }
 };
 
