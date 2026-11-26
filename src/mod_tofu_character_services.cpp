@@ -10,6 +10,8 @@
  *   set. The 3.3.5a client then shows its own rename, race change or faction change screen at the character list,
  *   and the core's CharacterHandler does the conversion.
  * - Leave combat: ends the player's combat state outside instances when nothing alive is attacking nearby.
+ * - Refresh all cooldowns: clears every spell and item cooldown of the player and the active pet, out of combat and
+ *   outside instances (Player::RemoveAllSpellCooldown, the call behind the GM command .cooldown).
  * - Menus for other modules' player commands: Autonomous alts and Alt parties (.autoalt, mod-autonomous-altbots),
  *   AoE loot (.aoeloot, mod-aoe-loot), XP rate (.xp, mod-individual-xp), and the per-character Realm First opt-out
  *   (.realmfirst optout, Tofu fork of mod-realm-first-titles). Each option runs the real command for
@@ -34,6 +36,7 @@
 #include "Log.h"
 #include "Map.h"
 #include "ObjectAccessor.h"
+#include "Pet.h"
 #include "Player.h"
 #include "ScriptMgr.h"
 #include "ScriptedGossip.h"
@@ -95,6 +98,7 @@ namespace
     constexpr uint32 ACTION_XP = 13;
     constexpr uint32 ACTION_REALM_FIRST_OFF = 14;
     constexpr uint32 ACTION_REALM_FIRST_ON = 15;
+    constexpr uint32 ACTION_RESET_COOLDOWNS = 16;
 
     // Autonomous alts (action = character GUID unless noted).
     constexpr uint32 SENDER_ALT_SELECT = 0x54430010;
@@ -154,6 +158,8 @@ namespace
         bool aoeLoot = false;
         bool xp = false;
         bool realmFirst = false;
+        bool resetCooldowns = false;
+        uint32 resetCooldownsCost = 0;
     };
 
     ModuleConfig g_Config;
@@ -177,6 +183,8 @@ namespace
         g_Config.aoeLoot = sConfigMgr->GetOption<bool>("TofuCharServices.AoeLoot.Enable", false);
         g_Config.xp = sConfigMgr->GetOption<bool>("TofuCharServices.Xp.Enable", false);
         g_Config.realmFirst = sConfigMgr->GetOption<bool>("TofuCharServices.RealmFirst.Enable", false);
+        g_Config.resetCooldowns = sConfigMgr->GetOption<bool>("TofuCharServices.ResetCooldowns.Enable", false);
+        g_Config.resetCooldownsCost = sConfigMgr->GetOption<uint32>("TofuCharServices.ResetCooldowns.Cost", 0);
     }
 
     std::string Icon(char const* name)
@@ -703,6 +711,59 @@ namespace
 
         player->CombatStopWithPets(true);
         Notify(player, "You are no longer in combat.");
+    }
+
+    // ---------------------------------------------------------------------------------------------------------
+    // Refresh all cooldowns
+    // ---------------------------------------------------------------------------------------------------------
+
+    void ResetCooldowns(Player* player)
+    {
+        CloseGossipMenuFor(player);
+
+        if (!g_Config.enable || !g_Config.resetCooldowns)
+        {
+            Notify(player, "That service is closed.");
+            return;
+        }
+        if (player->GetSession()->IsHeadless())
+        {
+            Notify(player, "Bots cannot use character services.");
+            return;
+        }
+        if (player->IsInCombat())
+        {
+            Notify(player, "You cannot refresh your cooldowns while in combat.");
+            return;
+        }
+        if (player->GetMap()->Instanceable())
+        {
+            Notify(player, "You cannot refresh your cooldowns inside a dungeon, raid, battleground, or arena.");
+            return;
+        }
+
+        uint32 const cost = g_Config.resetCooldownsCost;
+        if (cost && !player->HasEnoughMoney(cost))
+        {
+            Notify(player, "You need " + MoneyText(cost) + " to refresh your cooldowns.");
+            return;
+        }
+        if (cost)
+            player->ModifyMoney(-int32(cost));
+
+        // Every spell and item cooldown (Hearthstone, trinkets, and potions included); the client is told each one is clear.
+        player->RemoveAllSpellCooldown();
+
+        // The active pet's cooldowns, the same way Player::RemoveArenaSpellCooldowns(true) clears them.
+        if (Pet* pet = player->GetPet())
+        {
+            for (auto const& cooldown : pet->m_CreatureSpellCooldowns)
+                player->SendClearCooldown(cooldown.first, pet);
+            pet->m_CreatureSpellCooldowns.clear();
+        }
+
+        LOG_INFO("module", "mod-tofu-character-services: {} (guid {}) refreshed all cooldowns for {} copper.", player->GetName(), player->GetGUID().GetCounter(), cost);
+        Notify(player, "Your cooldowns are refreshed.");
     }
 
     // ---------------------------------------------------------------------------------------------------------
@@ -1331,6 +1392,9 @@ namespace
             if (g_Config.leaveCombat && player->IsInCombat())
                 AddGossipItemFor(player, GOSSIP_ICON_CHAT, Icon("Achievement_BG_AB_defendflags") + "Leave combat", SENDER_MAIN, ACTION_LEAVE_COMBAT);
 
+            if (g_Config.resetCooldowns && !player->IsInCombat())
+                AddGossipItemFor(player, GOSSIP_ICON_CHAT, Icon("Spell_Holy_BorrowedTime") + "Refresh all cooldowns", SENDER_MAIN, ACTION_RESET_COOLDOWNS, "Refresh every spell and item cooldown, your Hearthstone and your pet's included?", g_Config.resetCooldownsCost, false);
+
             if (g_Config.autoAlt)
                 AddGossipItemFor(player, GOSSIP_ICON_CHAT, Icon("Spell_Holy_PrayerOfSpirit") + "Autonomous alts", SENDER_MAIN, ACTION_ALTS);
             if (g_Config.autoAlt && g_Config.autoAltParties)
@@ -1437,6 +1501,9 @@ public:
                 break;
             case ACTION_LEAVE_COMBAT:
                 LeaveCombat(player);
+                break;
+            case ACTION_RESET_COOLDOWNS:
+                ResetCooldowns(player);
                 break;
             case ACTION_BACK_TO_MAIN:
                 ShowMainMenu(player, creature);

@@ -12,8 +12,9 @@ An AzerothCore module for Tofu Worldview (mod-playerbots fork of azerothcore-wot
 8. **Toggle AoE loot: ON/OFF** (`.aoeloot on|off`): one option that shows the current state, read from the player setting `mod-aoe-loot` index 0 kept by the Tofu mod-aoe-loot fork (the choice survives relogs and restarts). The new state is shown on screen.
 9. **My XP rate**: show my XP rate, set a custom XP rate from 1 to 20, reset back to 1 (`.xp view|set|default`). Turning XP gain on or off is left to the Experience Eliminator NPCs.
 10. **Toggle Realm First achievement eligibility: ON/OFF** (`.realmfirst optout on|off`, Tofu fork of mod-realm-first-titles with `RealmFirstTitles.AllowPlayerOptOut = 1`); the new state is shown on screen in yellow. Off keeps the Realm Firsts the character already holds and leaves new ones open for others; turning it back on counts only new progress.
+11. **Refresh all cooldowns**: shown only out of combat. Clears every spell and item cooldown (Hearthstone, trinkets, and potions included) and your active pet's, at the price in `TofuCharServices.ResetCooldowns.Cost`. Refused inside dungeons, raids, battlegrounds, and arenas. Debuffs such as Forbearance, Sated, Exhaustion, Hypothermia, and Weakened Soul stay.
 
-Sections 6 to 10 each have their own settings key and are off by default.
+Sections 6 to 11 each have their own settings key and are off by default.
 
 While a name, race, or faction change is waiting, the menu shows **Cancel my pending change** instead, which refunds what you paid. Bots cannot use the services.
 
@@ -24,6 +25,7 @@ While a name, race, or faction change is waiting, the menu shows **Cancel my pen
 - What was paid for the pending change is kept in the player setting `mod-tofu-character-services` index 0 (`character_settings`, needs `EnablePlayerSettings = 1`).
 - Bots are recognized by their headless session, so the module does not depend on mod-playerbots.
 - Sections 6 to 10 run the real player command for you through `ChatHandler::ParseCommands`, the same path as typing it, so each module's checks, permissions, challenge locks, and replies apply unchanged, and this module does not link against those modules. Typed input (a party name, an XP rate) comes from the dialog's text box and is validated before it goes into a command. The menus read state with SELECTs only: `character_settings` source `mod_autonomous_altbots` index 0, `tofu_autoalt_party`, `tofu_autoalt_party_member`, and the player settings `mod-realm-first-titles` index 0 and `mod-aoe-loot` index 0. The Autonomous alts menu also has a read-only list of every autonomous alt on the realm (any account) with its level, class, whether it is in the world, and its account name; it cannot change anything.
+- Refresh all cooldowns calls `Player::RemoveAllSpellCooldown()` (the call behind the GM command `.cooldown`), then clears the active pet's `m_CreatureSpellCooldowns` and sends the client a clear for each, as `Player::RemoveArenaSpellCooldowns(true)` does. A cooldown that only starts when its aura ends (Stealth, Presence of Mind, Nature's Swiftness while active) is cleared on the server, but its icon stays grey until the aura drops.
 - If one of those modules renames a command or subcommand, its menu here must change the same way.
 
 ## Install

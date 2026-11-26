@@ -5,7 +5,7 @@
 ########################################
 #
 # Archivist Ellery Ashby <Character Services> (creature 900042, place with .npc add 900042): arrange the account's
-# characters, change name, change race, change faction, and leave combat, plus menus for the player commands of
+# characters, change name, change race, change faction, leave combat, and refresh all cooldowns, plus menus for the player commands of
 # mod-autonomous-altbots (.autoalt), mod-aoe-loot (.aoeloot), and mod-individual-xp (.xp), each with its own key
 # below. Bots never get these services.
 #
@@ -49,6 +49,21 @@ TofuCharServices.LeaveCombat.Enable = 1
 #        Default:     50
 
 TofuCharServices.LeaveCombat.Range = 50
+
+#    TofuCharServices.ResetCooldowns.Enable
+#        Description: Offer "Refresh all cooldowns" while the player is out of combat: clears every spell and item
+#                     cooldown (Hearthstone, trinkets, and potions included) and the active pet's. Refused inside
+#                     instances (dungeons, raids, battlegrounds, arenas). Debuffs such as Forbearance and Sated stay.
+#        Default:     0 - Off
+#                     1 - On
+
+TofuCharServices.ResetCooldowns.Enable = 0
+
+#    TofuCharServices.ResetCooldowns.Cost
+#        Description: Price in copper (10000 = 1 gold) for each refresh. 0 is free.
+#        Default:     0
+
+TofuCharServices.ResetCooldowns.Cost = 0
 
 #    TofuCharServices.AutoAlt.Enable
 #        Description: Show "Autonomous alts": the account's other characters marked on or off, each with Turn on,
